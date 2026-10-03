@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from .aggregation import WindowAggregator
 from .alerting import AlertManager
+from .backfill import BackfillReport, run_backfill
 from .ingest import IngestionConfig, IngestionManager
 from .models import (
     Aggregate,
@@ -56,6 +57,8 @@ class TelemetryPipeline:
         self._last_eval_window: int | None = None
         # sink：聚合校验通过 -> 落 WAL -> 返回 None
         self.ingestion.set_sink(self._sink)
+        # precheck：窗口已关的事实性预检，优先于限流等瞬时判定
+        self.ingestion.set_precheck(self.aggregator.check_window_open)
         self._recover()
 
     # ------------------------------------------------------------------
@@ -72,6 +75,22 @@ class TelemetryPipeline:
 
     def ingest(self, point: MetricPoint | LogEvent) -> IngestResult:
         return self.ingestion.ingest(point)
+
+    def backfill(
+        self,
+        events: list[MetricPoint | LogEvent],
+        *,
+        batch_id: str | None = None,
+    ) -> BackfillReport:
+        """批量补报入口：整批投递历史事件，逐条给出结论并汇总。"""
+        import uuid
+
+        return run_backfill(
+            self.ingestion.ingest,
+            list(events),
+            batch_id=batch_id or uuid.uuid4().hex,
+            window_size_ms=self.aggregator.window_size_ms,
+        )
 
     def export(self, path: str, *, include_open_windows: bool = True,
                include_events: bool = False) -> str:
@@ -130,6 +149,8 @@ class TelemetryPipeline:
                 "alerts": self.alerts.snapshot(),
                 "seen_keys": sorted(self.ingestion.seen_keys),
                 "series": sorted(self.ingestion.series),
+                # 限流配额随快照延续：重启不会把已用掉的量清零
+                "rate_limiter": self.ingestion.rate_limiter_snapshot(),
             }
             self.store.write_snapshot(state)
             self.store.truncate_wal()
@@ -149,6 +170,10 @@ class TelemetryPipeline:
                     set(snap.get("seen_keys", ())) | extra_keys,
                     set(snap.get("series", ())) | extra_series,
                 )
+                # 恢复限流配额余量：重启前已用掉的量继续有效
+                limiter = snap.get("rate_limiter")
+                if limiter is not None:
+                    self.ingestion.restore_rate_limiter(limiter)
             else:
                 keys: set[str] = set()
                 series: set[str] = set()

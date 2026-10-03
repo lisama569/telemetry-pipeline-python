@@ -57,6 +57,26 @@ class WindowAggregator:
     # ------------------------------------------------------------------
     # 写入
     # ------------------------------------------------------------------
+    def check_window_open(self, series: str, timestamp_ms: int) -> RejectReason | None:
+        """非破坏性预检：该事件时间对应的窗口是否还在接收数据。
+
+        只读、不改动任何状态；窗口封口与水位都是单调的，
+        因此一旦返回 ``WINDOW_CLOSED``，随后的正式写入也必然得到同一结论——
+        该事实性判定不随并发/限流压力漂移。
+        """
+        with self._lock:
+            ws = floor_window(timestamp_ms, self.window_size_ms)
+            agg = self._windows.get((series, ws))
+            if agg is not None and agg.sealed:
+                return RejectReason.WINDOW_CLOSED
+            if (
+                self._watermark_ms >= 0
+                and ws + self.window_size_ms + self.allowed_lateness_ms
+                <= self._watermark_ms
+            ):
+                return RejectReason.WINDOW_CLOSED
+            return None
+
     def apply(self, record: dict, *, trusted: bool = False) -> RejectReason | None:
         """并入一条事件记录。
 

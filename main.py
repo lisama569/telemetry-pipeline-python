@@ -7,6 +7,7 @@
 接口：
 - POST /metrics        上报指标（幂等键去重 / 基数 / 速率限流）
 - POST /logs           上报日志
+- POST /backfill       批量补报历史事件（逐条结论 + 汇总，整批幂等）
 - POST /flush          推进水位、封口窗口并驱动告警判定
 - POST /alerts/rules   新增告警规则
 - PUT  /alerts/rules   更新规则（不改写历史判定）
@@ -81,6 +82,14 @@ class RuleIn(BaseModel):
 
 class FlushIn(BaseModel):
     watermark_ms: int | None = None
+
+
+class BackfillIn(BaseModel):
+    """批量补报请求：一批历史事件（指标/日志混合），逐条给结论。"""
+
+    batch_id: str | None = None
+    metrics: list[MetricIn] = Field(default_factory=list)
+    logs: list[LogIn] = Field(default_factory=list)
 
 
 def _ingest_response(result) -> dict:
@@ -187,6 +196,31 @@ def get_aggregates(sealed_only: bool = False) -> dict:
 def get_alerts() -> dict:
     state = pipeline.alerts.snapshot()
     return state
+
+
+@app.post("/backfill")
+def backfill(body: BackfillIn) -> dict:
+    """批量补报：整批投递历史事件，逐条结论 + 汇总，单条失败不影响整批。"""
+    events: list = [
+        MetricPoint(
+            name=m.name, value=m.value, timestamp_ms=m.timestamp_ms,
+            idempotency_key=m.idempotency_key, labels=m.labels,
+        )
+        for m in body.metrics
+    ]
+    for entry in body.logs:
+        try:
+            level = LogLevel(entry.level.upper())
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"未知日志级别：{entry.level}")
+        events.append(
+            LogEvent(
+                message=entry.message, level=level, timestamp_ms=entry.timestamp_ms,
+                idempotency_key=entry.idempotency_key, labels=entry.labels,
+            )
+        )
+    report = pipeline.backfill(events, batch_id=body.batch_id)
+    return report.to_dict()
 
 
 @app.post("/snapshot")

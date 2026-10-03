@@ -12,13 +12,14 @@ telemetry/
   models.py       数据模型与枚举（事件、IngestResult、Aggregate、AlertRule/状态…）
   clock.py        窗口对齐与可注入时钟
   storage.py      本地持久化：仅追加 WAL + 原子快照
-  ingest.py       采集入口：幂等去重、基数上限、令牌桶限流
+  ingest.py       采集入口：幂等去重、窗口预检、基数上限、令牌桶限流
   aggregation.py  固定窗口聚合、乱序/迟到、水位游标、封口
   alerting.py     告警规则、PENDING/FIRING/SUPPRESSED/RESOLVED 状态机
+  backfill.py     批量补报入口：整批投递、逐条结论、汇总报告
   pipeline.py     门面：装配上述组件，负责闭环与重启恢复
   exporter.py     聚合/告警报告的确定性 JSON 导出
 main.py           FastAPI 本地演示服务
-tests/            单元测试 + 并发/乱序/限流场景测试（日志打印窗口/幂等键/依据）
+tests/            单元测试 + 并发/乱序/限流/补报场景测试（日志打印窗口/幂等键/依据）
 ```
 
 ## 2. 数据模型
@@ -61,22 +62,32 @@ tests/            单元测试 + 并发/乱序/限流场景测试（日志打印
 
 ## 4. 去重与限流规则
 
-写入在同一把锁内依次做 4 类判定，拒绝原因互不相同、绝不静默丢弃：
+写入在同一把锁内按**固定优先级**依次判定，拒绝原因互不相同、绝不静默丢弃，
+一条数据同时踩到多个条件时结论唯一、不随线程调度漂移：
 
 | 顺序 | 拒绝原因 `RejectReason` | 判定条件 |
 |---|---|---|
 | 1 | `BAD_INPUT` | 空幂等键/非法时间戳/空指标名/NaN/非字符串标签… |
 | 2 | `DUPLICATE` | 幂等键已在此前**成功**写入（含重启后从状态恢复的键） |
-| 3 | `CARDINALITY_LIMIT` | 新序列会使不同序列数超过 `max_cardinality` |
-| 4 | `RATE_LIMIT` | 令牌桶（容量 `rate_burst`，补充 `rate_limit_per_sec`）令牌不足 |
-| 5 | `WINDOW_CLOSED` / `CURSOR_BACKWARD` | 下游窗口层拒绝 |
+| 3 | `WINDOW_CLOSED` | 目标窗口已封口/已被水位翻过（**事实性预检**，见下） |
+| 4 | `CARDINALITY_LIMIT` | 新序列会使不同序列数超过 `max_cardinality` |
+| 5 | `RATE_LIMIT` | 令牌桶（容量 `rate_burst`，补充 `rate_limit_per_sec`）令牌不足 |
+
+**事实性结论优先于瞬时压力**：`WINDOW_CLOSED` 由窗口层提供只读预检
+（`check_window_open`），在去重之后、限流之前判定。窗口封口与水位都是单调的，
+因此"窗口已关"一旦成立就永远成立——无论当时写入压力多大、令牌桶是否刚好耗尽，
+落在已封口窗口上的数据都稳定判为 `WINDOW_CLOSED`，不会被说成 `RATE_LIMIT`；
+反过来，窗口仍在接收、只是写得太快被挡下的，判为 `RATE_LIMIT`，两者严格区分。
+窗口已关的补报**不消耗**限流令牌，不会挤占在线写入配额。
 
 关键一致性约定：
 
 - 幂等键、基数集合**只有在下游（聚合+WAL）成功后才提交**，
   因此任何拒绝都不会污染已有聚合或"抢占"幂等键；
 - 被拒事件不写 WAL，重放结果与在线聚合天然一致；
-- 所有判定在锁内完成，多线程并发下同一幂等键**恰好接受一次**。
+- 所有判定在锁内完成，多线程并发下同一幂等键**恰好接受一次**；
+- 限流令牌桶余量随快照持久化，重启后从余量继续补充，
+  **不会出现重启一次等于限额清零**、原本该挡的写入被放行的情况。
 
 ## 5. 告警语义
 
@@ -97,19 +108,51 @@ RESOLVED ──再次连续超阈值──▶ FIRING                   (新一�
   （`alert_history`）永不重算、不改写**；
 - 判定历史随快照持久化，重启后状态（FIRING/SUPPRESSED…）完整恢复。
 
-## 6. 进程重启恢复
+## 6. 批量补报与重放（运维补数）
+
+运维手里的离线历史数据（事件时间是过去、可能乱序、可能整批重复提交、
+可能横跨已翻篇的窗口）可以**一次性整批投递**：
+
+```python
+report = pipe.backfill(events, batch_id="ops-2026-10-01")
+# 或 HTTP：POST /backfill {"batch_id": "...", "metrics": [...], "logs": [...]}
+```
+
+语义约定：
+
+- **逐条结论，整批不失败**：每条事件独立走与在线写入完全相同的判定链
+  （去重 → 窗口预检 → 基数 → 限流），单条有问题只影响自己；
+  返回 `BackfillReport`：总数、接受数、拒绝数、按原因分类的拒绝计数，
+  以及每条的状态/原因/依据/目标窗口，日志同步打印窗口区间、幂等键与判定依据；
+- **结论稳定可复现**：批内按输入顺序逐条判定，判定优先级固定；
+  落在已封口窗口上的补报稳定判 `WINDOW_CLOSED`（事实性结论，
+  不受限流压力与线程调度影响），同一份输入重复执行结论一致；
+- **重复补报幂等**：同一批再次投递时，已接受条目稳定判 `DUPLICATE`，
+  不重复落盘、不重复计数，两次报告的结论逐条对得上；
+- **跨重启延续**：去重键、序列集合、聚合状态、限流配额余量都随
+  快照/WAL 恢复，重启后重放同一段历史，逐条结论与最终聚合与重启前一致。
+
+**与在线采集的兼容范围**：补报与在线实时上报共用同一条判定链与同一把锁，
+互不干扰——在线事件不会被补报挤掉配额（窗口已关的补报不耗令牌），
+补报落在仍开放的迟到窗口内会正常并入聚合，落在已封口窗口上被明确拒绝；
+告警仍只在 `flush` 封口时判定一次，补报不会触发重复告警。
+
+## 7. 进程重启恢复
 
 构造 `TelemetryPipeline` 时自动执行：
 
 1. 读 `snapshot.json`（无快照则从空状态开始）；
 2. 重放 `events.log`：快照之后的已接受事件通过 **trusted 通道**并入聚合
    （它们是历史已接受事实，不受重启后更高水位/封口影响），并补入去重与基数集合；
-3. 无快照时，幂等键/序列集合直接由全部 WAL 记录重建。
+3. 无快照时，幂等键/序列集合直接由全部 WAL 记录重建；
+4. 恢复快照中的**限流令牌桶余量**：重启前已用掉的配额继续有效，
+   重启本身不会重置限额。
 
 运行期调用 `pipeline.snapshot()` 会用「临时文件 + fsync + 原子 rename」
-写入快照并清空 WAL，保证不存在半截文件。
+写入快照（聚合 + 告警 + 幂等键/序列集合 + 限流余量）并清空 WAL，
+保证不存在半截文件。
 
-## 7. 本地验证
+## 8. 本地验证
 
 ```bash
 # 安装依赖（Python >= 3.14）
@@ -121,11 +164,15 @@ uv run pytest
 # 只看并发+乱序+限流场景
 uv run pytest tests/test_observability_scenarios.py -s
 
+# 只看批量补报/重放场景（日志含窗口区间、幂等键、逐条判定依据）
+uv run pytest tests/test_backfill.py -s
+
 # 启动 HTTP 演示服务
 uv run uvicorn main:app --reload
 # 然后可尝试：
 #   POST /metrics   上报指标
 #   POST /logs      上报日志
+#   POST /backfill  批量补报历史事件（逐条结论 + 汇总）
 #   POST /flush     封口并跑告警
 #   GET  /aggregates、GET /alerts
 #   POST /snapshot、POST /export
@@ -150,13 +197,19 @@ pipe.alerts.add_rule(AlertRule("cpu_high", "metric:cpu", ">", 5.0, for_windows=2
 pipe.ingest(MetricPoint("cpu", 8.0, 100, "evt-1"))
 pipe.ingest(MetricPoint("cpu", 9.0, 1100, "evt-2"))
 print(pipe.ingest(MetricPoint("cpu", 8.0, 100, "evt-1")).reason)  # RejectReason.DUPLICATE
+
+# 批量补报：整批投递，逐条结论 + 汇总
+bf = pipe.backfill([MetricPoint("cpu", 7.0, 200, "hist-1"),
+                    MetricPoint("cpu", 7.0, 200, "hist-1")], batch_id="ops-1")
+print(bf.accepted, bf.rejected_by_reason)   # 1 {'duplicate': 1}
+
 report = pipe.flush(watermark_ms=3000)      # 封口 + 告警判定
 for e in report.evaluations:
     print(e.window_start_ms, e.state.value, e.reason)
 pipe.export("./data/report.json")
 ```
 
-## 8. 测试覆盖对照
+## 9. 测试覆盖对照
 
 | 需求 | 测试 |
 |---|---|
@@ -170,3 +223,10 @@ pipe.export("./data/report.json")
 | 单规则失败隔离 | `test_rule_failure_isolation` |
 | 重启恢复（WAL / 快照+WAL） | `test_restart_recovers_state_and_still_dedups` |
 | 导出确定性 | `test_export_report_is_deterministic` |
+| 批量补报逐条结论与汇总 | `test_backfill_batch_mixed_outcomes`、`test_backfill_endpoint_per_item_verdicts` |
+| 窗口已关不被限流掩盖、不耗配额 | `test_backfill_window_closed_never_masked_by_rate_limit` |
+| 并发补报同键恰好一次 | `test_backfill_concurrent_submission_accepted_once` |
+| 同一批重复补报幂等 | `test_backfill_repeat_submission_is_idempotent` |
+| 补报跨重启重放一致（WAL / 快照） | `test_backfill_restart_replay_consistent` |
+| 限流配额跨重启延续 | `test_backfill_quota_persists_across_restart` |
+| 补报与在线采集兼容 | `test_backfill_coexists_with_online_ingest` |

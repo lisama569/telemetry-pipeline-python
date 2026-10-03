@@ -65,3 +65,33 @@ def test_log_and_bad_level(client):
         "idempotency_key": "l2",
     })
     assert bad.status_code == 400
+
+
+def test_backfill_endpoint_per_item_verdicts(client):
+    """批量补报 HTTP 入口：逐条结论 + 汇总，重复补报幂等。"""
+    payload = {
+        "batch_id": "ops-1",
+        "metrics": [
+            _metric("bf-1", 100, 1.0),
+            _metric("bf-2", 200, 2.0),
+        ],
+        "logs": [
+            {"message": "disk full", "level": "ERROR", "timestamp_ms": 300,
+             "idempotency_key": "bf-3"},
+        ],
+    }
+    r = client.post("/backfill", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["batch_id"] == "ops-1"
+    assert body["total"] == 3 and body["accepted"] == 3 and body["rejected"] == 0
+    assert [x["idempotency_key"] for x in body["results"]] == ["bf-1", "bf-2", "bf-3"]
+    assert all(x["status"] == "accepted" for x in body["results"])
+
+    # 同一批重复补报：全部判 duplicate，不重复计数
+    again = client.post("/backfill", json=payload).json()
+    assert again["accepted"] == 0 and again["rejected"] == 3
+    assert again["rejected_by_reason"] == {"duplicate": 3}
+    aggs = client.get("/aggregates").json()["aggregates"]
+    cpu = [a for a in aggs if a["series"] == "metric:cpu"][0]
+    assert cpu["count"] == 2 and cpu["sum"] == 3.0

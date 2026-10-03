@@ -1,12 +1,16 @@
 """采集入库层：并发写入、幂等去重、基数与速率限流。
 
-拒绝原因（见 ``RejectReason``）互相可区分，绝不静默丢弃：
+拒绝原因（见 ``RejectReason``）互相可区分，绝不静默丢弃。判定在同一把锁内
+按**固定优先级**依次执行，结论唯一、不随线程调度漂移：
 1. ``BAD_INPUT``         —— 字段不合法（在加锁前快速失败）；
 2. ``DUPLICATE``         —— 幂等键已被接受过；
-3. ``CARDINALITY_LIMIT`` —— 新序列会突破基数上限；
-4. ``RATE_LIMIT``        —— 令牌桶不足，超过写入速率配额；
+3. ``WINDOW_CLOSED``     —— 目标窗口已封口（事实性结论，经 precheck 预检，
+   优先于瞬时压力类判定：写入压力再大也不会被说成别的原因）；
+4. ``CARDINALITY_LIMIT`` —— 新序列会突破基数上限；
+5. ``RATE_LIMIT``        —— 令牌桶不足，超过写入速率配额（瞬时压力，
+   与"窗口已关"严格区分，互不混淆）；
 随后交给 ``sink`` 回调（由管道装配为存储+聚合），sink 还可能返回
-``WINDOW_CLOSED`` / ``CURSOR_BACKWARD`` 这两类拒绝。
+``WINDOW_CLOSED`` / ``CURSOR_BACKWARD`` 这两类拒绝（与预检结论一致）。
 
 全部判定与消费在同一把锁内完成，保证多线程并发上报时结论确定。
 """
@@ -28,6 +32,10 @@ from .models import (
 
 # sink 接收规范化记录，返回拒绝原因或 None 表示接受
 Sink = Callable[[dict], RejectReason | None]
+
+# precheck 接收 (series, timestamp_ms)，返回事实性拒绝原因（如 WINDOW_CLOSED）
+# 或 None；在限流等瞬时压力判定之前执行，保证事实性结论稳定优先。
+Precheck = Callable[[str, int], RejectReason | None]
 
 
 class TokenBucket:
@@ -60,6 +68,25 @@ class TokenBucket:
                 return True
             return False
 
+    # ------------------------------------------------------------------
+    # 配额跨重启延续：快照保存剩余令牌，恢复时从该余量继续补充，
+    # 不会出现"重启一次等于限额清零、已用掉的量被抹掉"的情况。
+    # ------------------------------------------------------------------
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "tokens": self._tokens,
+                "capacity": self.capacity,
+                "refill_per_sec": self.refill_per_sec,
+            }
+
+    def restore(self, state: dict) -> None:
+        with self._lock:
+            tokens = float(state.get("tokens", self.capacity))
+            # 余量不超出当前配置容量（配置可能在重启间调小）
+            self._tokens = min(self.capacity, max(0.0, tokens))
+            self._last_ms = int(time.monotonic() * 1000)
+
 
 def _series_key(kind: str, name: str, labels: dict[str, str]) -> str:
     """规范化序列名：标签按 key 排序，保证结论与字典顺序无关。"""
@@ -82,6 +109,7 @@ class IngestionManager:
     def __init__(self, config: IngestionConfig | None = None, sink: Sink | None = None) -> None:
         self.config = config or IngestionConfig()
         self._sink: Sink = sink or (lambda _record: None)
+        self._precheck: Precheck = lambda _series, _ts: None
         self._seen_keys: set[str] = set()
         self._series: set[str] = set()
         self._bucket = TokenBucket(
@@ -91,6 +119,10 @@ class IngestionManager:
 
     def set_sink(self, sink: Sink) -> None:
         self._sink = sink
+
+    def set_precheck(self, precheck: Precheck) -> None:
+        """注册事实性预检（窗口是否已关），在限流判定之前执行。"""
+        self._precheck = precheck
 
     # ------------------------------------------------------------------
     # 恢复支持（重启后由管道注入历史状态，见 pipeline.py）
@@ -109,6 +141,15 @@ class IngestionManager:
     def series(self) -> set[str]:
         with self._lock:
             return set(self._series)
+
+    # ------------------------------------------------------------------
+    # 限流配额快照（跨重启延续已用掉的量，见 TokenBucket.snapshot）
+    # ------------------------------------------------------------------
+    def rate_limiter_snapshot(self) -> dict:
+        return self._bucket.snapshot()
+
+    def restore_rate_limiter(self, state: dict) -> None:
+        self._bucket.restore(state)
 
     # ------------------------------------------------------------------
     # 校验
@@ -165,14 +206,23 @@ class IngestionManager:
                 point.labels,
             )
 
-            # 2) 基数限流：不得污染已有聚合（新序列尚未加入集合）
+            # 2) 事实性预检：窗口已关是稳定结论，必须优先于限流等瞬时判定，
+            #    且预检不消耗令牌（窗口已关的补报不应占用在线写入配额）
+            closed = self._precheck(series, point.timestamp_ms)
+            if closed is not None:
+                return IngestResult(
+                    IngestStatus.REJECTED, key, closed,
+                    "目标窗口已封口，不再接收该事件时间的数据",
+                )
+
+            # 3) 基数限流：不得污染已有聚合（新序列尚未加入集合）
             if series not in self._series and len(self._series) >= self.config.max_cardinality:
                 return IngestResult(
                     IngestStatus.REJECTED, key, RejectReason.CARDINALITY_LIMIT,
                     f"序列基数已达上限 {self.config.max_cardinality}，拒绝新序列 {series}",
                 )
 
-            # 3) 速率限流：令牌桶不足
+            # 4) 速率限流：令牌桶不足
             if not self._bucket.try_consume(1.0):
                 return IngestResult(
                     IngestStatus.REJECTED, key, RejectReason.RATE_LIMIT,
@@ -181,7 +231,8 @@ class IngestionManager:
 
             record = self._to_record(point, series)
 
-            # 4) 下游（存储/窗口）可能再拒绝：已关闭窗口、游标回退
+            # 5) 下游（存储/窗口）可能再拒绝：已关闭窗口、游标回退
+            #    （与预检结论一致，此处为兜底权威判定）
             rejected = self._sink(record)
             if rejected is not None:
                 return IngestResult(
