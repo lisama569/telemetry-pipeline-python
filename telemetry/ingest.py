@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .models import (
@@ -76,10 +77,43 @@ class IngestionConfig:
     rate_burst: int = 1000               # 突发容量
 
 
+class IngestGate:
+    """排他批处理期间对去重/基数状态的只读查询 + 成功后提交。
+
+    仅允许在 ``IngestionManager.exclusive()`` 持有的写锁内使用：
+    与在线 ``ingest`` 共用同一份集合，保证补报与在线上报互相可见、
+    提交互不覆盖。
+    """
+
+    __slots__ = ("_seen_keys", "_series", "max_cardinality")
+
+    def __init__(self, seen_keys: set[str], series: set[str],
+                 max_cardinality: int) -> None:
+        self._seen_keys = seen_keys
+        self._series = series
+        self.max_cardinality = max_cardinality
+
+    def has_key(self, key: str) -> bool:
+        return key in self._seen_keys
+
+    def has_series(self, series: str) -> bool:
+        return series in self._series
+
+    @property
+    def series_count(self) -> int:
+        return len(self._series)
+
+    def commit(self, key: str, series: str) -> None:
+        """下游（聚合+WAL）成功后才提交去重键与基数。"""
+        self._seen_keys.add(key)
+        self._series.add(series)
+
+
 class IngestionManager:
     """线程安全的采集入口。"""
 
-    def __init__(self, config: IngestionConfig | None = None, sink: Sink | None = None) -> None:
+    def __init__(self, config: IngestionConfig | None = None, sink: Sink | None = None,
+                 *, lock: threading.RLock | None = None) -> None:
         self.config = config or IngestionConfig()
         self._sink: Sink = sink or (lambda _record: None)
         self._seen_keys: set[str] = set()
@@ -87,7 +121,8 @@ class IngestionManager:
         self._bucket = TokenBucket(
             self.config.rate_burst, self.config.rate_limit_per_sec
         )
-        self._lock = threading.RLock()
+        # 允许与管道/补报共用同一把可重入锁，统一加锁序、避免多锁环
+        self._lock = lock if lock is not None else threading.RLock()
 
     def set_sink(self, sink: Sink) -> None:
         self._sink = sink
@@ -109,6 +144,19 @@ class IngestionManager:
     def series(self) -> set[str]:
         with self._lock:
             return set(self._series)
+
+    # ------------------------------------------------------------------
+    # 排他批处理通道（供批量补报复用同一把写锁与去重/基数状态）
+    # ------------------------------------------------------------------
+    @contextmanager
+    def exclusive(self) -> Iterator["IngestGate"]:
+        """持有写锁的排他上下文。
+
+        进入即拿到 IngestionManager 的同一把锁，因此在线 ``ingest``
+        与批量补报在该上下文内严格串行化；门控对象仅在锁内可安全使用。
+        """
+        with self._lock:
+            yield IngestGate(self._seen_keys, self._series, self.config.max_cardinality)
 
     # ------------------------------------------------------------------
     # 校验

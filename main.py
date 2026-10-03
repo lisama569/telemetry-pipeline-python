@@ -7,6 +7,7 @@
 接口：
 - POST /metrics        上报指标（幂等键去重 / 基数 / 速率限流）
 - POST /logs           上报日志
+- POST /backfill       批量补报离线历史数据（逐条结论 + 收/挡汇总，整批不整体失败）
 - POST /flush          推进水位、封口窗口并驱动告警判定
 - POST /alerts/rules   新增告警规则
 - PUT  /alerts/rules   更新规则（不改写历史判定）
@@ -24,6 +25,7 @@ import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from telemetry.backfill import BackfillConfig
 from telemetry.ingest import IngestionConfig
 from telemetry.models import (
     AlertRule,
@@ -37,6 +39,7 @@ from telemetry.pipeline import TelemetryPipeline
 DATA_DIR = os.environ.get("TELEMETRY_DATA_DIR", "./data")
 WINDOW_MS = int(os.environ.get("TELEMETRY_WINDOW_MS", "1000"))
 LATENESS_MS = int(os.environ.get("TELEMETRY_LATENESS_MS", "500"))
+BACKFILL_QUOTA = int(os.environ.get("TELEMETRY_BACKFILL_QUOTA", "-1"))
 
 app = FastAPI(title="local-telemetry-pipeline")
 pipeline = TelemetryPipeline(
@@ -48,6 +51,7 @@ pipeline = TelemetryPipeline(
         rate_limit_per_sec=float(os.environ.get("TELEMETRY_RATE_PER_SEC", "1000")),
         rate_burst=int(os.environ.get("TELEMETRY_RATE_BURST", "1000")),
     ),
+    backfill_config=BackfillConfig(quota_total=BACKFILL_QUOTA),
 )
 
 
@@ -77,6 +81,19 @@ class RuleIn(BaseModel):
     threshold: float
     for_windows: int = 1
     resolve_windows: int = 1
+
+
+class BackfillItemIn(BaseModel):
+    """补报条目：kind=metric（默认）或 log，二者可混在同一批。"""
+
+    kind: str = "metric"
+    name: str | None = None
+    value: float | None = None
+    message: str | None = None
+    level: str = "INFO"
+    timestamp_ms: int
+    idempotency_key: str
+    labels: dict[str, str] = Field(default_factory=dict)
 
 
 class FlushIn(BaseModel):
@@ -123,6 +140,71 @@ def post_log(body: LogIn) -> dict:
     if result.status is IngestStatus.REJECTED:
         raise HTTPException(status_code=429, detail=_ingest_response(result))
     return _ingest_response(result)
+
+
+@app.post("/backfill")
+def post_backfill(body: dict) -> dict:
+    """批量补报离线历史数据。
+
+    请求体：``{"items": [ ...metric/log 条目... ]}``。
+    与在线上报不同：**整批不会因为个别条目有问题而整体失败**——每条单独
+    给出 accepted/rejected 结论（按输入下标对齐），并汇总收/挡数量与各
+    拒绝原因计数；只要请求体结构可解析，HTTP 一律 200，结论看逐条 reason。
+    结论确定可复现，重复补报同一批不会重复计数。
+    """
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list):
+        raise HTTPException(status_code=400, detail="请求体需为 {'items': [...]}")
+
+    points: list = []
+    parse_bad: dict[int, str] = {}
+    for i, raw in enumerate(raw_items):
+        try:
+            item = BackfillItemIn(**raw)
+            if item.kind == "metric":
+                points.append(MetricPoint(
+                    name=item.name or "", value=item.value if item.value is not None else 0.0,
+                    timestamp_ms=item.timestamp_ms,
+                    idempotency_key=item.idempotency_key, labels=item.labels,
+                ))
+            elif item.kind == "log":
+                points.append(LogEvent(
+                    message=item.message or "", level=LogLevel(item.level.upper()),
+                    timestamp_ms=item.timestamp_ms,
+                    idempotency_key=item.idempotency_key, labels=item.labels,
+                ))
+            else:
+                parse_bad[i] = f"不支持的 kind：{item.kind}"
+                points.append(MetricPoint(
+                    name="", value=0.0, timestamp_ms=item.timestamp_ms,
+                    idempotency_key=item.idempotency_key, labels=item.labels,
+                ))
+        except (TypeError, ValueError) as exc:
+            parse_bad[i] = f"条目解析失败：{exc}"
+            key = raw.get("idempotency_key", "") if isinstance(raw, dict) else ""
+            ts = raw.get("timestamp_ms", -1) if isinstance(raw, dict) else -1
+            points.append(MetricPoint(
+                name="", value=0.0,
+                timestamp_ms=ts if isinstance(ts, int) and ts >= 0 else 0,
+                idempotency_key=key if isinstance(key, str) else "",
+            ))
+
+    report = pipeline.backfill(points)
+    return {
+        "total": report.total,
+        "accepted": report.accepted,
+        "rejected": report.rejected,
+        "reason_counts": report.reason_counts,
+        "results": [
+            {
+                "index": item.index,
+                **_ingest_response(item.result),
+                **({"parse_error": parse_bad[item.index]}
+                   if item.index in parse_bad else {}),
+            }
+            for item in report.results
+        ],
+    }
 
 
 @app.post("/flush")

@@ -57,11 +57,18 @@ class WindowAggregator:
     # ------------------------------------------------------------------
     # 写入
     # ------------------------------------------------------------------
-    def apply(self, record: dict, *, trusted: bool = False) -> RejectReason | None:
+    def apply(self, record: dict, *, trusted: bool = False,
+              advance_watermark: bool = True) -> RejectReason | None:
         """并入一条事件记录。
 
         ``trusted=True`` 用于重启重放：记录是过去已接受的事实，
         跳过水位/封口检查，但仍保持聚合运算的确定性。
+
+        ``advance_watermark=False`` 用于批量补报：补报是离线历史重放，
+        事件时间跨度可能很大且到达顺序由调用方/调度决定；若让每条补报
+        推进水位，先到的高时间戳切块会把后处理切块的低时间戳事件误判成
+        WINDOW_CLOSED，结论就依赖线程调度。补报因此**只并入聚合、不推进
+        水位**；水位由在线数据与显式 ``flush`` 决定，保证补报可重放。
         """
         with self._lock:
             ts = record["timestamp_ms"]
@@ -79,9 +86,30 @@ class WindowAggregator:
 
             self._merge(key, series, ws, record)
 
-            # 随事件推进水位（只增不减）
-            if ts > self._watermark_ms:
+            # 在线写入随事件推进水位（只增不减）；补报/可重放通道不推进
+            if advance_watermark and ts > self._watermark_ms:
                 self._watermark_ms = ts
+            return None
+
+    def classify_apply(self, record: dict) -> RejectReason | None:
+        """纯读取的写入预判：只返回该记录 *当前* 是否会被窗口层拒绝。
+
+        与 :meth:`apply`（``trusted=False``）的封口/水位预判保持同一套事实
+        判定，但**不推进水位、不并入聚合**，供批量补报在整批裁决前把
+        "窗口已关"稳定识别为事实性结论——无论写入压力或限流如何，说法都不会
+        变成别的。调用方持锁时，与随后真正的 ``apply`` 结论一致。
+        """
+        with self._lock:
+            ts = record["timestamp_ms"]
+            ws = floor_window(ts, self.window_size_ms)
+            record["window_start_ms"] = ws
+            key = (record["series"], ws)
+            agg = self._windows.get(key)
+            if agg is not None and agg.sealed:
+                return RejectReason.WINDOW_CLOSED
+            if self._watermark_ms >= 0 and ws + self.window_size_ms \
+                    + self.allowed_lateness_ms <= self._watermark_ms:
+                return RejectReason.WINDOW_CLOSED
             return None
 
     def _merge(self, key: tuple[str, int], series: str, ws: int, record: dict) -> None:

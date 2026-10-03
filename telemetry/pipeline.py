@@ -16,11 +16,13 @@ from dataclasses import dataclass, field
 
 from .aggregation import WindowAggregator
 from .alerting import AlertManager
+from .backfill import BackfillConfig, BackfillManager
 from .ingest import IngestionConfig, IngestionManager
 from .models import (
     Aggregate,
     AlertEvaluation,
     AlertState,
+    BackfillReport,
     IngestResult,
     LogEvent,
     MetricPoint,
@@ -28,7 +30,7 @@ from .models import (
 )
 from .storage import LocalStore
 
-PIPELINE_STATE_VERSION = 1
+PIPELINE_STATE_VERSION = 2
 
 
 @dataclass
@@ -47,12 +49,23 @@ class TelemetryPipeline:
         window_size_ms: int = 1000,
         allowed_lateness_ms: int = 0,
         ingestion_config: IngestionConfig | None = None,
+        backfill_config: BackfillConfig | None = None,
     ) -> None:
         self.store = LocalStore(store_dir)
+        # 单一共享可重入锁：采集、补报、聚合封口、快照共用同一把锁，
+        # 统一加锁序，杜绝"在线/补报/快照"之间的多锁环。
+        self._lock = threading.RLock()
         self.aggregator = WindowAggregator(window_size_ms, allowed_lateness_ms)
         self.alerts = AlertManager()
-        self.ingestion = IngestionManager(ingestion_config)
-        self._lock = threading.RLock()
+        self.ingestion = IngestionManager(ingestion_config, lock=self._lock)
+        self.backfills = BackfillManager(
+            self.ingestion,
+            backfill_config,
+            sink=self._backfill_sink,
+            window_classifier=self._classify_backfill_window,
+            window_size_ms=window_size_ms,
+            lock=self._lock,
+        )
         self._last_eval_window: int | None = None
         # sink：聚合校验通过 -> 落 WAL -> 返回 None
         self.ingestion.set_sink(self._sink)
@@ -70,8 +83,34 @@ class TelemetryPipeline:
             self.store.append_event(record)
             return None
 
+    def _classify_backfill_window(self, record: dict) -> RejectReason | None:
+        """补报专用：纯读预判窗口是否已关（事实性结论，不推进水位）。"""
+        with self._lock:
+            return self.aggregator.classify_apply(record)
+
+    def _backfill_sink(self, record: dict) -> RejectReason | None:
+        """补报专用 sink：并入聚合并落 WAL，但**不推进水位**。
+
+        这样补报事件时间跨度再大、切块再乱，也不会因某条高时间戳数据先被
+        处理而把其它低时间戳数据误判成窗口已关，结论只取决于 flush 决定的
+        水位事实与封口状态，可跨线程/跨机器复现。
+        """
+        with self._lock:
+            rejected = self.aggregator.apply(record, advance_watermark=False)
+            if rejected is not None:
+                return rejected
+            self.store.append_event(record)
+            return None
+
     def ingest(self, point: MetricPoint | LogEvent) -> IngestResult:
         return self.ingestion.ingest(point)
+
+    def backfill(self, points: list[MetricPoint | LogEvent]) -> BackfillReport:
+        """一次性补报一批离线历史数据。
+
+        每条独立给结论、整批不因个别坏数据失败；判定与聚合均确定可复现。
+        """
+        return self.backfills.backfill(points)
 
     def export(self, path: str, *, include_open_windows: bool = True,
                include_events: bool = False) -> str:
@@ -130,6 +169,7 @@ class TelemetryPipeline:
                 "alerts": self.alerts.snapshot(),
                 "seen_keys": sorted(self.ingestion.seen_keys),
                 "series": sorted(self.ingestion.series),
+                "backfill": self.backfills.snapshot(),
             }
             self.store.write_snapshot(state)
             self.store.truncate_wal()
@@ -149,6 +189,8 @@ class TelemetryPipeline:
                     set(snap.get("seen_keys", ())) | extra_keys,
                     set(snap.get("series", ())) | extra_series,
                 )
+                # 补报额度：快照口径 + 快照后 WAL 中来源为补报的条数，重启不清零
+                self.backfills.restore(snap.get("backfill"), wal_records=replay)
             else:
                 keys: set[str] = set()
                 series: set[str] = set()
@@ -158,14 +200,20 @@ class TelemetryPipeline:
                     keys.add(record["idempotency_key"])
                     series.add(record["series"])
                 self.ingestion.restore(keys, series)
+                self.backfills.restore(None, wal_records=replay)
 
     def rebuild_dedup_from_wal(self) -> None:
-        """从快照 + WAL 重建幂等键与基数集合（测试/运维辅助）。"""
+        """从快照 + WAL 重建幂等键、基数集合与补报额度（测试/运维辅助）。"""
         with self._lock:
-            keys = {r["idempotency_key"] for r in self.store.read_events()}
-            series = {r["series"] for r in self.store.read_events()}
+            records = list(self.store.read_events())
+            keys = {r["idempotency_key"] for r in records}
+            series = {r["series"] for r in records}
             snap = self.store.read_snapshot()
             if snap is not None:
                 keys |= set(snap.get("seen_keys", ()))
                 series |= set(snap.get("series", ()))
             self.ingestion.restore(keys, series)
+            self.backfills.restore(
+                snap.get("backfill") if snap is not None else None,
+                wal_records=records,
+            )

@@ -103,6 +103,31 @@ class IngestResult:
 
 
 # ---------------------------------------------------------------------------
+# 批量补报侧模型
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class BackfillItemResult:
+    """批量补报中单条数据的结论（按输入下标对齐，逐条可解释）。"""
+
+    index: int
+    result: IngestResult
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillReport:
+    """一次批量补报的汇总：收了多少、挡了多少、各原因多少、逐条结论。"""
+
+    total: int
+    accepted: int
+    rejected: int
+    reason_counts: dict[str, int]
+    results: list[BackfillItemResult] = field(default_factory=list)
+
+    def result_for(self, index: int) -> IngestResult:
+        return self.results[index].result
+
+
+# ---------------------------------------------------------------------------
 # 聚合侧模型
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)

@@ -65,3 +65,45 @@ def test_log_and_bad_level(client):
         "idempotency_key": "l2",
     })
     assert bad.status_code == 400
+
+
+def test_backfill_batch_endpoint_per_item(client):
+    # 先在线写一条并封口窗口 0、1
+    client.post("/metrics", json=_metric("online-1", 100, 1.0))
+    client.post("/flush", json={"watermark_ms": 2000})
+
+    payload = {"items": [
+        {"kind": "metric", "name": "cpu", "value": 5.0,
+         "timestamp_ms": 2500, "idempotency_key": "bf-ok"},
+        {"kind": "metric", "name": "cpu", "value": 9.0,
+         "timestamp_ms": 200, "idempotency_key": "bf-old"},       # window_closed
+        {"kind": "metric", "name": "cpu", "value": 9.0,
+         "timestamp_ms": 2600, "idempotency_key": "online-1"},    # duplicate
+        {"kind": "log", "message": "boom", "level": "ERROR",
+         "timestamp_ms": 2700, "idempotency_key": "bf-log"},
+        {"kind": "metric", "name": "cpu", "value": 1.0,
+         "timestamp_ms": 2800, "idempotency_key": ""},            # bad_input
+    ]}
+    r = client.post("/backfill", json=payload)
+    # 整批不因个别坏条目整体失败
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total"] == 5 and data["accepted"] == 2
+    assert data["rejected"] == 3
+    assert data["reason_counts"] == {
+        "window_closed": 1, "duplicate": 1, "bad_input": 1,
+    }
+    by_key = {row["idempotency_key"]: row for row in data["results"]}
+    assert by_key["bf-ok"]["status"] == "accepted"
+    assert by_key["bf-old"]["reason"] == "window_closed"
+    assert by_key["online-1"]["reason"] == "duplicate"
+    assert by_key["bf-log"]["status"] == "accepted"
+
+    # 同一批重复补报：不再接受任何新条目
+    r2 = client.post("/backfill", json=payload)
+    assert r2.json()["accepted"] == 0
+
+
+def test_backfill_bad_shape_is_400(client):
+    r = client.post("/backfill", json={"nope": []})
+    assert r.status_code == 400
