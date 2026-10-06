@@ -11,7 +11,7 @@ from dataclasses import asdict
 
 from .aggregation import WindowAggregator
 from .alerting import AlertManager
-from .storage import LocalStore
+from .storage import LocalStore, is_watermark_marker
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
@@ -48,7 +48,11 @@ class Exporter:
             "alert_history": alert_snapshot["history"],
         }
         if include_events:
-            report["events"] = list(self.store.read_events())
+            # 只导出已接受事件；WAL 水位标记是内部恢复状态，不属于事件
+            report["events"] = [
+                r for r in self.store.read_events()
+                if not is_watermark_marker(r)
+            ]
         return report
 
     def export(self, path: str, *, include_open_windows: bool = True,

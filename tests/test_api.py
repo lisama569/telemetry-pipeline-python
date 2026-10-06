@@ -95,3 +95,42 @@ def test_backfill_endpoint_per_item_verdicts(client):
     aggs = client.get("/aggregates").json()["aggregates"]
     cpu = [a for a in aggs if a["series"] == "metric:cpu"][0]
     assert cpu["count"] == 2 and cpu["sum"] == 3.0
+
+
+def test_backfill_endpoint_bad_item_does_not_fail_batch(client):
+    """单条坏数据（缺字段/级别写错）只影响自己，整批照常返回逐条结论。"""
+    payload = {
+        "batch_id": "ops-bad-items",
+        "metrics": [
+            _metric("ok-1", 100, 1.0),                       # 合法 -> accepted
+            {"name": "cpu", "value": 2.0, "timestamp_ms": 200},  # 缺幂等键
+        ],
+        "logs": [
+            {"message": "boom", "level": "NOPE", "timestamp_ms": 300,
+             "idempotency_key": "bad-level"},                # 级别写错
+            {"message": "x", "level": "INFO",
+             "idempotency_key": "missing-ts"},               # 缺时间戳
+            {"message": "disk full", "level": "ERROR", "timestamp_ms": 400,
+             "idempotency_key": "ok-2"},                     # 合法 -> accepted
+        ],
+    }
+    r = client.post("/backfill", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 5
+    assert body["accepted"] == 2 and body["rejected"] == 3
+    assert body["rejected_by_reason"] == {"bad_input": 3}
+    verdicts = {x["idempotency_key"]: x for x in body["results"]}
+    assert verdicts["ok-1"]["status"] == "accepted"
+    assert verdicts["ok-2"]["status"] == "accepted"
+    assert verdicts["bad-level"]["reason"] == "bad_input"
+    assert verdicts["missing-ts"]["reason"] == "bad_input"
+    # 缺幂等键的条目也单独给出 bad_input 结论
+    assert any(x["reason"] == "bad_input" and "idempotency_key" in x["detail"]
+               for x in body["results"])
+    # 合法条目确实入库，坏数据没有污染聚合
+    aggs = client.get("/aggregates").json()["aggregates"]
+    cpu = [a for a in aggs if a["series"] == "metric:cpu"][0]
+    assert cpu["count"] == 1 and cpu["sum"] == 1.0
+    err = [a for a in aggs if a["series"] == "log:ERROR"][0]
+    assert err["count"] == 1

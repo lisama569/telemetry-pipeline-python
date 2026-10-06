@@ -52,7 +52,7 @@ class BackfillReport:
 
 def run_backfill(
     ingest_one,
-    events: list[MetricPoint | LogEvent],
+    events: list[MetricPoint | LogEvent | IngestResult],
     *,
     batch_id: str,
     window_size_ms: int,
@@ -61,17 +61,25 @@ def run_backfill(
 
     - 批内按输入顺序逐条判定，单条失败不影响其它条目；
     - 每条结论（含窗口区间、幂等键、判定依据）写入日志，便于离线复核；
-    - 判定本身由采集层完成（去重/窗口预检/基数/限流，优先级固定），
-      同一批重复补报时已接受条目稳定判为 DUPLICATE，不重复计数。
+    - 判定本身由采集层补报通道完成（去重/窗口预检/基数，优先级固定，
+      不含墙钟限流），同一批重复补报时已接受条目稳定判为 DUPLICATE，
+      不重复计数；
+    - ``events`` 中允许混入预先判定好的 ``IngestResult``（例如上游
+      解析失败的条目），原样计入报告与日志。
     """
     report = BackfillReport(batch_id=batch_id, total=len(events))
     logger.info(
         "补报开始 batch=%s 条数=%d 窗口大小=%dms", batch_id, len(events), window_size_ms
     )
     for seq, event in enumerate(events):
-        result = ingest_one(event)
+        if isinstance(event, IngestResult):
+            # 上游已给出结论的条目（如解析失败），不再过判定链
+            result = event
+            ts = None
+        else:
+            result = ingest_one(event)
+            ts = getattr(event, "timestamp_ms", None)
         report.results.append(result)
-        ts = getattr(event, "timestamp_ms", None)
         if isinstance(ts, int):
             ws = (ts // window_size_ms) * window_size_ms
             window = f"[{ws},{ws + window_size_ms})"

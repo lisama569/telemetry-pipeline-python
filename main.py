@@ -28,10 +28,12 @@ from pydantic import BaseModel, Field
 from telemetry.ingest import IngestionConfig
 from telemetry.models import (
     AlertRule,
+    IngestResult,
     IngestStatus,
     LogEvent,
     LogLevel,
     MetricPoint,
+    RejectReason,
 )
 from telemetry.pipeline import TelemetryPipeline
 
@@ -85,11 +87,15 @@ class FlushIn(BaseModel):
 
 
 class BackfillIn(BaseModel):
-    """批量补报请求：一批历史事件（指标/日志混合），逐条给结论。"""
+    """批量补报请求：一批历史事件（指标/日志混合），逐条给结论。
+
+    条目按原始 dict 接收：单条缺字段/级别写错只影响自己（判 BAD_INPUT），
+    不让整批一起失败。
+    """
 
     batch_id: str | None = None
-    metrics: list[MetricIn] = Field(default_factory=list)
-    logs: list[LogIn] = Field(default_factory=list)
+    metrics: list[dict] = Field(default_factory=list)
+    logs: list[dict] = Field(default_factory=list)
 
 
 def _ingest_response(result) -> dict:
@@ -198,27 +204,51 @@ def get_alerts() -> dict:
     return state
 
 
+def _bad_item(key: object, detail: str) -> IngestResult:
+    """单条坏数据的预定结论：只影响自己，不拖垮整批。"""
+    return IngestResult(
+        IngestStatus.REJECTED,
+        key if isinstance(key, str) else "",
+        RejectReason.BAD_INPUT,
+        detail,
+    )
+
+
+def _build_metric(d: dict) -> MetricPoint | IngestResult:
+    missing = [f for f in ("name", "value", "timestamp_ms", "idempotency_key")
+               if f not in d]
+    if missing:
+        return _bad_item(d.get("idempotency_key"),
+                         f"缺少字段: {', '.join(missing)}")
+    return MetricPoint(
+        name=d["name"], value=d["value"], timestamp_ms=d["timestamp_ms"],
+        idempotency_key=d["idempotency_key"], labels=d.get("labels") or {},
+    )
+
+
+def _build_log(d: dict) -> LogEvent | IngestResult:
+    missing = [f for f in ("message", "timestamp_ms", "idempotency_key")
+               if f not in d]
+    if missing:
+        return _bad_item(d.get("idempotency_key"),
+                         f"缺少字段: {', '.join(missing)}")
+    level = d.get("level", "INFO")
+    try:
+        level = LogLevel(str(level).upper())
+    except ValueError:
+        # 级别写错：保留原始值交给采集层校验，单条判 BAD_INPUT
+        pass
+    return LogEvent(
+        message=d["message"], level=level, timestamp_ms=d["timestamp_ms"],
+        idempotency_key=d["idempotency_key"], labels=d.get("labels") or {},
+    )
+
+
 @app.post("/backfill")
 def backfill(body: BackfillIn) -> dict:
     """批量补报：整批投递历史事件，逐条结论 + 汇总，单条失败不影响整批。"""
-    events: list = [
-        MetricPoint(
-            name=m.name, value=m.value, timestamp_ms=m.timestamp_ms,
-            idempotency_key=m.idempotency_key, labels=m.labels,
-        )
-        for m in body.metrics
-    ]
-    for entry in body.logs:
-        try:
-            level = LogLevel(entry.level.upper())
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"未知日志级别：{entry.level}")
-        events.append(
-            LogEvent(
-                message=entry.message, level=level, timestamp_ms=entry.timestamp_ms,
-                idempotency_key=entry.idempotency_key, labels=entry.labels,
-            )
-        )
+    events: list = [_build_metric(m) for m in body.metrics]
+    events.extend(_build_log(entry) for entry in body.logs)
     report = pipeline.backfill(events, batch_id=body.batch_id)
     return report.to_dict()
 

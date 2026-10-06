@@ -13,6 +13,13 @@
 ``WINDOW_CLOSED`` / ``CURSOR_BACKWARD`` 这两类拒绝（与预检结论一致）。
 
 全部判定与消费在同一把锁内完成，保证多线程并发上报时结论确定。
+
+补报通道（``ingest_backfill``）：与在线通道共用去重/窗口预检/基数判定，
+但**不经过墙钟令牌桶**——令牌桶按 ``time.monotonic()`` 补充，同一份输入
+在快慢不同的机器、不同时刻重放会得到不同结论，且会挤占在线写入配额。
+补报判定只依赖持久化状态（去重集合、封口地平线、基数集合），
+因此同一份历史数据无论怎么切分、怎么并发、在哪台机器上重放，
+逐条结论都完全一致；补报与在线实时上报互不干扰。
 """
 from __future__ import annotations
 
@@ -174,7 +181,10 @@ class IngestionManager:
                 return "日志级别非法"
         else:
             return "不支持的事件类型"
-        if not all(isinstance(k, str) and isinstance(v, str) for k, v in point.labels.items()):
+        if not isinstance(point.labels, dict) or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in point.labels.items()
+        ):
             return "labels 必须全部为字符串键值"
         return None
 
@@ -182,6 +192,20 @@ class IngestionManager:
     # 写入
     # ------------------------------------------------------------------
     def ingest(self, point: MetricPoint | LogEvent) -> IngestResult:
+        """在线实时上报通道：完整判定链，含墙钟令牌桶限流。"""
+        return self._ingest(point, rate_limited=True)
+
+    def ingest_backfill(self, point: MetricPoint | LogEvent) -> IngestResult:
+        """批量补报通道：与在线相同的去重/窗口/基数判定，但不限流。
+
+        判定只依赖持久化状态、不含墙钟，保证重放结论确定；
+        同时不消耗在线写入配额，补报与在线实时上报互不干扰。
+        """
+        return self._ingest(point, rate_limited=False)
+
+    def _ingest(
+        self, point: MetricPoint | LogEvent, *, rate_limited: bool
+    ) -> IngestResult:
         bad = self._validate(point)
         if bad is not None:
             return IngestResult(
@@ -222,8 +246,9 @@ class IngestionManager:
                     f"序列基数已达上限 {self.config.max_cardinality}，拒绝新序列 {series}",
                 )
 
-            # 4) 速率限流：令牌桶不足
-            if not self._bucket.try_consume(1.0):
+            # 4) 速率限流：令牌桶不足（仅在线通道；补报通道跳过，
+            #    保证补报结论与机器快慢、重放时刻无关）
+            if rate_limited and not self._bucket.try_consume(1.0):
                 return IngestResult(
                     IngestStatus.REJECTED, key, RejectReason.RATE_LIMIT,
                     f"写入速率超过 {self.config.rate_limit_per_sec}/s 配额",

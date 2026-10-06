@@ -3,11 +3,14 @@
 闭环与恢复：
 - 写入：仅当聚合窗口接受时，事件才追加到 WAL，再提交幂等状态；
   被去重/限流/关闭窗口拒绝的事件不落盘、不污染聚合。
-- 恢复：加载 ``snapshot.json``（聚合+告警+已接受幂等键），
-  随后以 trusted 通道重放快照之后的 WAL，结论可重放且一致。
-- 封口：``flush`` 推进水位、封口到期窗口，并对每个封口窗口驱动一次
-  全部规则判定；单条规则失败仅记录隔离原因，不阻塞其它链路。
-- 快照：聚合状态 + 告警状态 + 幂等键集合原子落盘，然后清空 WAL。
+- 封口：``flush`` 先把**水位标记**追加到 WAL（先落盘、后生效），
+  再推进封口地平线、封口到期窗口，并对每个封口窗口驱动一次全部规则判定；
+  单条规则失败仅记录隔离原因，不阻塞其它链路。
+- 恢复：加载 ``snapshot.json``（聚合+告警+已接受幂等键+限流余量），
+  随后重放快照之后的 WAL（事件走 trusted 通道，水位标记恢复封口地平线），
+  结论可重放且与重启前一致——"窗口已关"的事实不会被重启抹掉。
+- 快照：聚合状态（含封口地平线）+ 告警状态 + 幂等键集合 + 限流余量
+  原子落盘，然后清空 WAL。
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ from .models import (
     MetricPoint,
     RejectReason,
 )
-from .storage import LocalStore
+from .storage import LocalStore, is_watermark_marker, make_watermark_marker
 
 PIPELINE_STATE_VERSION = 1
 
@@ -78,15 +81,21 @@ class TelemetryPipeline:
 
     def backfill(
         self,
-        events: list[MetricPoint | LogEvent],
+        events: list[MetricPoint | LogEvent | IngestResult],
         *,
         batch_id: str | None = None,
     ) -> BackfillReport:
-        """批量补报入口：整批投递历史事件，逐条给出结论并汇总。"""
+        """批量补报入口：整批投递历史事件，逐条给出结论并汇总。
+
+        走补报专用判定通道（不占用在线限流配额、判定不含墙钟），
+        保证同一份输入无论怎么切分/并发/在什么机器上跑，结论都一致。
+        ``events`` 中允许混入预先判定好的 ``IngestResult``
+        （例如 HTTP 层解析失败的条目），原样计入报告。
+        """
         import uuid
 
         return run_backfill(
-            self.ingestion.ingest,
+            self.ingestion.ingest_backfill,
             list(events),
             batch_id=batch_id or uuid.uuid4().hex,
             window_size_ms=self.aggregator.window_size_ms,
@@ -107,8 +116,15 @@ class TelemetryPipeline:
     # 封口 + 告警
     # ------------------------------------------------------------------
     def flush(self, watermark_ms: int | None = None) -> FlushReport:
-        """推进水位、封口窗口，并对每个新封口窗口评估全部告警规则。"""
+        """推进水位、封口窗口，并对每个新封口窗口评估全部告警规则。
+
+        先把水位标记写入 WAL 再改动内存状态（先落盘、后生效），
+        保证崩溃/重启后"窗口已关"的事实性结论可以重放出来。
+        """
         with self._lock:
+            target = self.aggregator.plan_seal_target(watermark_ms)
+            if target is not None:
+                self.store.append_event(make_watermark_marker(target))
             sealed = self.aggregator.seal_due_windows(watermark_ms)
             wm = self.aggregator.watermark_ms
             evaluations: list[AlertEvaluation] = []
@@ -156,7 +172,7 @@ class TelemetryPipeline:
             self.store.truncate_wal()
 
     def _recover(self) -> None:
-        """进程重启恢复：快照 + WAL 重放。"""
+        """进程重启恢复：快照 + WAL 重放（事件 + 水位标记）。"""
         with self._lock:
             snap = self.store.read_snapshot()
             replay = list(self.store.read_events())
@@ -164,8 +180,9 @@ class TelemetryPipeline:
                 self.aggregator.restore(snap["aggregation"], replay=replay)
                 self.alerts.restore(snap["alerts"])
                 # 快照后的 WAL 已接受事件也要补进去重/基数集合
-                extra_keys = {r["idempotency_key"] for r in replay}
-                extra_series = {r["series"] for r in replay}
+                events = [r for r in replay if not is_watermark_marker(r)]
+                extra_keys = {r["idempotency_key"] for r in events}
+                extra_series = {r["series"] for r in events}
                 self.ingestion.restore(
                     set(snap.get("seen_keys", ())) | extra_keys,
                     set(snap.get("series", ())) | extra_series,
@@ -178,17 +195,30 @@ class TelemetryPipeline:
                 keys: set[str] = set()
                 series: set[str] = set()
                 for record in replay:
+                    if is_watermark_marker(record):
+                        # 水位标记：恢复封口地平线，
+                        # "窗口已关"的事实性结论跨重启稳定
+                        self.aggregator.apply_watermark_marker(
+                            record["watermark_ms"]
+                        )
+                        continue
                     # 无快照：全部历史都是首次重放
                     self.aggregator.apply(record, trusted=True)
                     keys.add(record["idempotency_key"])
                     series.add(record["series"])
+                # 地平线恢复后补打 sealed 标志，与快照路径对齐
+                self.aggregator.reseal_due()
                 self.ingestion.restore(keys, series)
 
     def rebuild_dedup_from_wal(self) -> None:
         """从快照 + WAL 重建幂等键与基数集合（测试/运维辅助）。"""
         with self._lock:
-            keys = {r["idempotency_key"] for r in self.store.read_events()}
-            series = {r["series"] for r in self.store.read_events()}
+            events = [
+                r for r in self.store.read_events()
+                if not is_watermark_marker(r)
+            ]
+            keys = {r["idempotency_key"] for r in events}
+            series = {r["series"] for r in events}
             snap = self.store.read_snapshot()
             if snap is not None:
                 keys |= set(snap.get("seen_keys", ()))

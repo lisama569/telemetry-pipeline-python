@@ -2,7 +2,9 @@
 
 设计目标（崩溃可恢复、结论可重放）：
 - ``events.log``  仅追加 JSONL 日志：只有 *已接受* 的事件才落盘，
-  被拒绝的事件不会污染 WAL，因此重放结果与在线聚合一致。
+  被拒绝的事件不会污染 WAL，因此重放结果与在线聚合一致；
+  除事件外还记录**水位标记**（显式 flush 推进的封口地平线），
+  保证无快照重启后"窗口已关"的事实性结论依然可以重放。
 - ``snapshot.json`` 原子快照：保存聚合结果、告警状态与水位游标，
   重启时优先加载快照，再重放快照之后的 WAL 记录即可恢复。
 - 线程锁保证同一进程内并发写入的串行化；文件写入采用
@@ -18,6 +20,21 @@ from typing import Any
 
 WAL_NAME = "events.log"
 SNAPSHOT_NAME = "snapshot.json"
+
+# WAL 里的水位标记：显式 flush（封口地平线推进）是会影响后续逐条结论的
+# 事实性操作，必须随 WAL 持久化；否则无快照重启后"窗口已关"的判定依据丢失，
+# 重放同一段历史会得到与重启前不同的结论。
+WATERMARK_MARKER_TYPE = "watermark"
+
+
+def make_watermark_marker(watermark_ms: int) -> dict[str, Any]:
+    """构造一条水位标记 WAL 记录。"""
+    return {"record_type": WATERMARK_MARKER_TYPE, "watermark_ms": int(watermark_ms)}
+
+
+def is_watermark_marker(record: dict[str, Any]) -> bool:
+    """该 WAL 记录是否为水位标记（而非已接受事件）。"""
+    return record.get("record_type") == WATERMARK_MARKER_TYPE
 
 
 class LocalStore:
