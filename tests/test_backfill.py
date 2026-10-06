@@ -16,16 +16,19 @@ logger = logging.getLogger("telemetry.backfill.tests")
 WINDOW_MS = 1000
 
 
-def _pipe(path, allowed_lateness_ms=0, **cfg_kw):
+def _pipe(path, allowed_lateness_ms=0, clock=None, **cfg_kw):
     cfg = IngestionConfig(
         max_cardinality=cfg_kw.pop("max_cardinality", 1000),
         rate_limit_per_sec=cfg_kw.pop("rate_limit_per_sec", 1_000_000),
         rate_burst=cfg_kw.pop("rate_burst", 1_000_000),
+        backfill_rate_limit_per_sec=cfg_kw.pop("backfill_rate_limit_per_sec", None),
+        backfill_rate_burst=cfg_kw.pop("backfill_rate_burst", None),
     )
     return TelemetryPipeline(
         str(path), window_size_ms=WINDOW_MS,
         allowed_lateness_ms=allowed_lateness_ms,
         ingestion_config=cfg,
+        clock=clock,
     )
 
 
@@ -93,16 +96,18 @@ def test_backfill_batch_mixed_outcomes(tmp_path, caplog):
 #    且窗口已关的补报不消耗在线写入配额；两类原因严格区分
 # ---------------------------------------------------------------------------
 def test_backfill_window_closed_never_masked_by_rate_limit(tmp_path, caplog):
-    pipe = _pipe(tmp_path / "s", rate_burst=2, rate_limit_per_sec=0)
-    pipe.ingest(MetricPoint("cpu", 1.0, 100, "online-1"))   # 消耗 1 令牌
+    # 补报通道独立配额：突发 1（在线配额突发 2，两者互不挤占）
+    pipe = _pipe(tmp_path / "s", rate_burst=2, rate_limit_per_sec=0,
+                 backfill_rate_burst=1, backfill_rate_limit_per_sec=0)
+    pipe.ingest(MetricPoint("cpu", 1.0, 100, "online-1"))   # 消耗在线 1 令牌
     pipe.flush(watermark_ms=WINDOW_MS)                      # 封口 [0,1000)
 
     with caplog.at_level(logging.INFO, logger="telemetry.backfill"):
         report = pipe.backfill([
             MetricPoint("cpu", 9.0, 100, "c1"),    # 窗口已关 -> WINDOW_CLOSED（不耗令牌）
             MetricPoint("cpu", 9.0, 200, "c2"),    # 窗口已关 -> WINDOW_CLOSED
-            MetricPoint("cpu", 5.0, 1500, "o1"),   # 窗口开放 -> 接受（用掉最后 1 令牌）
-            MetricPoint("cpu", 6.0, 1600, "o2"),   # 窗口开放但配额耗尽 -> RATE_LIMIT
+            MetricPoint("cpu", 5.0, 1500, "o1"),   # 窗口开放 -> 接受（用掉补报唯一令牌）
+            MetricPoint("cpu", 6.0, 1600, "o2"),   # 窗口开放但补报配额耗尽 -> RATE_LIMIT
             MetricPoint("cpu", 9.0, 300, "c3"),    # 仍是 WINDOW_CLOSED，而非 RATE_LIMIT
         ], batch_id="batch-pressure")
 
@@ -117,6 +122,8 @@ def test_backfill_window_closed_never_masked_by_rate_limit(tmp_path, caplog):
     assert report.rejected_by_reason == {"window_closed": 3, "rate_limit": 1}
     # 已关窗口的补报没有消耗配额：o1 得以接受
     assert pipe.aggregator.get_aggregate("metric:cpu", 1000).total == 5.0
+    # 补报没有挤占在线配额：在线令牌桶只被 online-1 消耗过，仍可再写
+    assert pipe.ingest(MetricPoint("cpu", 7.0, 1700, "online-2")).accepted
     # 日志中两类原因各自可区分
     assert "原因=window_closed" in caplog.text
     assert "原因=rate_limit" in caplog.text

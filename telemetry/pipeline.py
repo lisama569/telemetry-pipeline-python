@@ -3,8 +3,14 @@
 闭环与恢复：
 - 写入：仅当聚合窗口接受时，事件才追加到 WAL，再提交幂等状态；
   被去重/限流/关闭窗口拒绝的事件不落盘、不污染聚合。
+- 通道：在线（online）事件随事件时间推进水位；补报（backfill）事件
+  只读水位、绝不推进——补报历史不会把在线仍在接收的窗口提前关掉，
+  同一批历史数据无论怎么排序/分批/并发，窗口开闭判定都一致。
 - 恢复：加载 ``snapshot.json``（聚合+告警+已接受幂等键），
-  随后以 trusted 通道重放快照之后的 WAL，结论可重放且一致。
+  随后以 trusted 通道重放快照之后的 WAL（事件按各自 channel 决定是否
+  推进水位，水位标记记录精确还原显式 flush 的推进），结论可重放且一致。
+- 限流：在线/补报各自独立的令牌桶，每次消费后落 ``limiter.json``，
+  进程停掉再起来（即便没来得及做快照）已用掉的额度也不会被清零。
 - 封口：``flush`` 推进水位、封口到期窗口，并对每个封口窗口驱动一次
   全部规则判定；单条规则失败仅记录隔离原因，不阻塞其它链路。
 - 快照：聚合状态 + 告警状态 + 幂等键集合原子落盘，然后清空 WAL。
@@ -17,7 +23,7 @@ from dataclasses import dataclass, field
 from .aggregation import WindowAggregator
 from .alerting import AlertManager
 from .backfill import BackfillReport, run_backfill
-from .ingest import IngestionConfig, IngestionManager
+from .ingest import CHANNEL_BACKFILL, CHANNEL_ONLINE, IngestionConfig, IngestionManager
 from .models import (
     Aggregate,
     AlertEvaluation,
@@ -27,7 +33,7 @@ from .models import (
     MetricPoint,
     RejectReason,
 )
-from .storage import LocalStore
+from .storage import RECORD_TYPE_WATERMARK, LocalStore
 
 PIPELINE_STATE_VERSION = 1
 
@@ -48,17 +54,20 @@ class TelemetryPipeline:
         window_size_ms: int = 1000,
         allowed_lateness_ms: int = 0,
         ingestion_config: IngestionConfig | None = None,
+        clock=None,
     ) -> None:
         self.store = LocalStore(store_dir)
         self.aggregator = WindowAggregator(window_size_ms, allowed_lateness_ms)
         self.alerts = AlertManager()
-        self.ingestion = IngestionManager(ingestion_config)
+        self.ingestion = IngestionManager(ingestion_config, clock=clock)
         self._lock = threading.RLock()
         self._last_eval_window: int | None = None
         # sink：聚合校验通过 -> 落 WAL -> 返回 None
         self.ingestion.set_sink(self._sink)
         # precheck：窗口已关的事实性预检，优先于限流等瞬时判定
         self.ingestion.set_precheck(self.aggregator.check_window_open)
+        # 限流状态持久化：每次消费令牌后落盘，重启不清零已用额度
+        self.ingestion.set_limiter_persister(self.store.write_limiter_state)
         self._recover()
 
     # ------------------------------------------------------------------
@@ -66,7 +75,9 @@ class TelemetryPipeline:
     # ------------------------------------------------------------------
     def _sink(self, record: dict) -> RejectReason | None:
         with self._lock:
-            rejected = self.aggregator.apply(record)
+            # 仅在线通道的记录随事件时间推进水位；补报通道只读水位
+            advance = record.get("channel", CHANNEL_ONLINE) == CHANNEL_ONLINE
+            rejected = self.aggregator.apply(record, advance_watermark=advance)
             if rejected is not None:
                 return rejected
             # 聚合接受后才落盘，保证 WAL 与聚合状态一致
@@ -82,11 +93,15 @@ class TelemetryPipeline:
         *,
         batch_id: str | None = None,
     ) -> BackfillReport:
-        """批量补报入口：整批投递历史事件，逐条给出结论并汇总。"""
+        """批量补报入口：整批投递历史事件，逐条给出结论并汇总。
+
+        走独立的 backfill 通道：不推进水位、使用独立限流配额，
+        与在线实时上报互不干扰。
+        """
         import uuid
 
         return run_backfill(
-            self.ingestion.ingest,
+            lambda e: self.ingestion.ingest(e, channel=CHANNEL_BACKFILL),
             list(events),
             batch_id=batch_id or uuid.uuid4().hex,
             window_size_ms=self.aggregator.window_size_ms,
@@ -109,8 +124,13 @@ class TelemetryPipeline:
     def flush(self, watermark_ms: int | None = None) -> FlushReport:
         """推进水位、封口窗口，并对每个新封口窗口评估全部告警规则。"""
         with self._lock:
+            before = self.aggregator.watermark_ms
             sealed = self.aggregator.seal_due_windows(watermark_ms)
             wm = self.aggregator.watermark_ms
+            if wm > before:
+                # 显式水位推进落 WAL：仅 WAL 恢复时也能精确还原水位，
+                # 重启前后"窗口已关"的判定保持一致
+                self.store.append_watermark(wm)
             evaluations: list[AlertEvaluation] = []
             # 按规则关注的 series 分组封口窗口：规则只对自己 series 的窗口判定，
             # 其它 series 的窗口不产生该规则的判定（避免错配）。
@@ -156,33 +176,39 @@ class TelemetryPipeline:
             self.store.truncate_wal()
 
     def _recover(self) -> None:
-        """进程重启恢复：快照 + WAL 重放。"""
+        """进程重启恢复：快照 + WAL（事件与水位标记按序）重放 + 限流状态。"""
         with self._lock:
             snap = self.store.read_snapshot()
-            replay = list(self.store.read_events())
+            records = list(self.store.read_records())
             if snap is not None:
-                self.aggregator.restore(snap["aggregation"], replay=replay)
+                self.aggregator.restore(snap["aggregation"])
                 self.alerts.restore(snap["alerts"])
-                # 快照后的 WAL 已接受事件也要补进去重/基数集合
-                extra_keys = {r["idempotency_key"] for r in replay}
-                extra_series = {r["series"] for r in replay}
-                self.ingestion.restore(
-                    set(snap.get("seen_keys", ())) | extra_keys,
-                    set(snap.get("series", ())) | extra_series,
-                )
-                # 恢复限流配额余量：重启前已用掉的量继续有效
-                limiter = snap.get("rate_limiter")
-                if limiter is not None:
-                    self.ingestion.restore_rate_limiter(limiter)
+                seen_keys = set(snap.get("seen_keys", ()))
+                series = set(snap.get("series", ()))
             else:
-                keys: set[str] = set()
-                series: set[str] = set()
-                for record in replay:
-                    # 无快照：全部历史都是首次重放
-                    self.aggregator.apply(record, trusted=True)
-                    keys.add(record["idempotency_key"])
-                    series.add(record["series"])
-                self.ingestion.restore(keys, series)
+                seen_keys = set()
+                series = set()
+            # 按 WAL 顺序重放：事件走 trusted 通道（已接受事实不因重启后
+            # 更高水位被拒），且只有 online 记录推进水位（与运行期一致）；
+            # 水位标记精确还原显式 flush 的推进。
+            for record in records:
+                if record.get("type") == RECORD_TYPE_WATERMARK:
+                    self.aggregator.advance_watermark(record["watermark_ms"])
+                    continue
+                advance = record.get("channel", CHANNEL_ONLINE) == CHANNEL_ONLINE
+                self.aggregator.apply(record, trusted=True,
+                                      advance_watermark=advance)
+                seen_keys.add(record["idempotency_key"])
+                series.add(record["series"])
+            self.ingestion.restore(seen_keys, series)
+            # 恢复限流配额余量：重启前已用掉的量继续有效。
+            # limiter.json 每次消费后落盘，是最新状态；快照内嵌的为兜底，
+            # 兼容旧版单桶格式。
+            limiter = self.store.read_limiter_state()
+            if limiter is None and snap is not None:
+                limiter = snap.get("rate_limiter")
+            if limiter is not None:
+                self.ingestion.restore_rate_limiter(limiter)
 
     def rebuild_dedup_from_wal(self) -> None:
         """从快照 + WAL 重建幂等键与基数集合（测试/运维辅助）。"""

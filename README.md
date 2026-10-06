@@ -40,7 +40,10 @@ tests/            单元测试 + 并发/乱序/限流/补报场景测试（日�
 本地存储目录（默认 `./data`）：
 
 - `events.log`：仅追加 JSONL（WAL），**只记录已接受事件**；
+  事件记录带 `channel`（`online`/`backfill`）标记，另含显式 flush 产生的
+  **水位标记**记录（`{"type": "watermark", ...}`）；
 - `snapshot.json`：聚合 + 告警 + 已接受幂等键/序列集合的原子快照；
+- `limiter.json`：限流令牌桶余量，每次成功消费令牌后原子落盘；
 - `report.json`：导出报告（由 `/export` 或 `Exporter` 生成）。
 
 ## 3. 窗口与乱序语义
@@ -50,9 +53,15 @@ tests/            单元测试 + 并发/乱序/限流/补报场景测试（日�
 - 聚合只计算 `count/sum/min/max/avg`，均与输入顺序无关；
   `last_timestamp_ms/last_value` 仅用于展示，不参与统计结论。
   因此窗口可以被反复重放，结论稳定（见 `test_out_of_order_is_stable`）。
-- **水位线（watermark）= 已观察到的最大事件时间，单调不减**：
-  - 显式把游标往回拨 → 返回 `CURSOR_BACKWARD`，状态不变；
-  - `flush(watermark_ms)` 只能前进不能后退。
+- **水位线（watermark）单调不减**，只从两个来源推进：
+  - **在线（online）通道**的事件随事件时间推进水位（实时数据到了，
+    旧窗口自然翻篇）；
+  - `flush(watermark_ms)` 显式推进（只能前进不能后退，
+    显式回拨游标 → `CURSOR_BACKWARD`，状态不变）。
+  **补报（backfill）通道的事件只读水位、绝不推进**——这是补报确定性的
+  基石：同一批历史数据无论怎么排序/分批/并发投递，窗口开闭判定都相同；
+  补报里混进时间戳异常大的记录，也不会把在线仍在接收的窗口提前关掉。
+  显式 flush 的推进会以水位标记写入 WAL，仅 WAL 恢复时也能精确还原。
 - **封口（seal）**：当 `window_end + allowed_lateness <= watermark`
   时窗口封口并冻结为不可变快照，随后驱动一次全部告警规则判定。
   封口幂等：重复 flush 不会重复产出、不改变结果。
@@ -71,7 +80,14 @@ tests/            单元测试 + 并发/乱序/限流/补报场景测试（日�
 | 2 | `DUPLICATE` | 幂等键已在此前**成功**写入（含重启后从状态恢复的键） |
 | 3 | `WINDOW_CLOSED` | 目标窗口已封口/已被水位翻过（**事实性预检**，见下） |
 | 4 | `CARDINALITY_LIMIT` | 新序列会使不同序列数超过 `max_cardinality` |
-| 5 | `RATE_LIMIT` | 令牌桶（容量 `rate_burst`，补充 `rate_limit_per_sec`）令牌不足 |
+| 5 | `RATE_LIMIT` | 所在通道的令牌桶令牌不足 |
+
+**双通道独立限流**：在线与补报各用各的令牌桶（在线：`rate_burst` /
+`rate_limit_per_sec`；补报：`backfill_rate_burst` /
+`backfill_rate_limit_per_sec`，缺省回落到在线配置），
+补报再猛也挤不占在线配额，反之亦然。令牌桶时钟可注入
+（`TelemetryPipeline(..., clock=...)`，默认单调时钟）：注入固定/手动时钟后，
+限流结论与机器快慢、调度抖动完全无关，可逐条复现。
 
 **事实性结论优先于瞬时压力**：`WINDOW_CLOSED` 由窗口层提供只读预检
 （`check_window_open`），在去重之后、限流之前判定。窗口封口与水位都是单调的，
@@ -86,7 +102,8 @@ tests/            单元测试 + 并发/乱序/限流/补报场景测试（日�
   因此任何拒绝都不会污染已有聚合或"抢占"幂等键；
 - 被拒事件不写 WAL，重放结果与在线聚合天然一致；
 - 所有判定在锁内完成，多线程并发下同一幂等键**恰好接受一次**；
-- 限流令牌桶余量随快照持久化，重启后从余量继续补充，
+- 限流令牌桶余量**每次成功消费后落 `limiter.json`**，并随快照持久化：
+  进程停掉再起来（即便没来得及做快照）已用掉的配额继续有效，
   **不会出现重启一次等于限额清零**、原本该挡的写入被放行的情况。
 
 ## 5. 告警语义
@@ -120,33 +137,55 @@ report = pipe.backfill(events, batch_id="ops-2026-10-01")
 
 语义约定：
 
-- **逐条结论，整批不失败**：每条事件独立走与在线写入完全相同的判定链
-  （去重 → 窗口预检 → 基数 → 限流），单条有问题只影响自己；
+- **逐条结论，整批不失败**：每条事件独立走判定链
+  （校验 → 去重 → 窗口预检 → 基数 → 限流），单条有问题只影响自己；
   返回 `BackfillReport`：总数、接受数、拒绝数、按原因分类的拒绝计数，
   以及每条的状态/原因/依据/目标窗口，日志同步打印窗口区间、幂等键与判定依据；
-- **结论稳定可复现**：批内按输入顺序逐条判定，判定优先级固定；
-  落在已封口窗口上的补报稳定判 `WINDOW_CLOSED`（事实性结论，
-  不受限流压力与线程调度影响），同一份输入重复执行结论一致；
+- **结论确定，与切分/顺序/并发/机器快慢无关**：补报走独立的
+  `backfill` 通道——**只读水位、绝不推进水位**，窗口开闭判定只取决于
+  在线水位与显式 flush，因此同一批历史数据无论怎么排序、分成几批、
+  几线程并发、在快慢不同的机器上跑，每个键的最终处置（接受/拒绝及原因）
+  与最终聚合都一模一样；判定优先级固定
+  （`BAD_INPUT > DUPLICATE > WINDOW_CLOSED > CARDINALITY_LIMIT > RATE_LIMIT`），
+  一条数据同时踩到多个条件时结论唯一，不随线程调度漂移；
+- **事实性结论不被瞬时压力掩盖**：落在已封口窗口上的补报稳定判
+  `WINDOW_CLOSED`（不消耗令牌、不受限流压力影响）；窗口仍开放只是
+  写得太快被挡的，判 `RATE_LIMIT`——两类原因严格分开；
 - **重复补报幂等**：同一批再次投递时，已接受条目稳定判 `DUPLICATE`，
   不重复落盘、不重复计数，两次报告的结论逐条对得上；
-- **跨重启延续**：去重键、序列集合、聚合状态、限流配额余量都随
-  快照/WAL 恢复，重启后重放同一段历史，逐条结论与最终聚合与重启前一致。
+- **跨重启延续**：去重键、序列集合、聚合状态、水位（含显式 flush 的
+  推进，经 WAL 水位标记还原）、限流配额余量（`limiter.json` + 快照）
+  都随快照/WAL 恢复，重启后重放同一段历史，逐条结论与最终聚合与重启前一致。
 
 **与在线采集的兼容范围**：补报与在线实时上报共用同一条判定链与同一把锁，
-互不干扰——在线事件不会被补报挤掉配额（窗口已关的补报不耗令牌），
-补报落在仍开放的迟到窗口内会正常并入聚合，落在已封口窗口上被明确拒绝；
-告警仍只在 `flush` 封口时判定一次，补报不会触发重复告警。
+但**配额各自独立**（补报耗尽自己的令牌桶不影响在线写入，反之亦然），
+且**补报不推进水位**——补报历史不会把在线仍在接收的窗口提前关掉，
+紧接着的实时上报照常接收；补报落在仍开放的迟到窗口内正常并入聚合，
+落在已封口窗口上被明确拒绝；告警仍只在 `flush` 封口时判定一次，
+补报不会触发重复告警。注意：若在线实时数据已把水位推过某窗口，
+并发补报该窗口的数据会被判 `WINDOW_CLOSED`——这是"窗口确实已翻篇"
+的事实性结论，而非补报与在线互相干扰。
+
+**限流结论的边界**：`RATE_LIMIT` 本质是背压信号——被拒的条目在配额
+恢复后重试可被接受（这正是限流的意义）。注入固定时钟后限流结论可
+逐条复现；使用真实时钟时，同一输入在不同机器上只有"恰好压在配额
+边界上"的条目可能在 `RATE_LIMIT`/`accepted` 之间变化，其余结论
+（去重、窗口已关、非法输入）均与机器快慢无关。
 
 ## 7. 进程重启恢复
 
 构造 `TelemetryPipeline` 时自动执行：
 
 1. 读 `snapshot.json`（无快照则从空状态开始）；
-2. 重放 `events.log`：快照之后的已接受事件通过 **trusted 通道**并入聚合
-   （它们是历史已接受事实，不受重启后更高水位/封口影响），并补入去重与基数集合；
-3. 无快照时，幂等键/序列集合直接由全部 WAL 记录重建；
-4. 恢复快照中的**限流令牌桶余量**：重启前已用掉的配额继续有效，
-   重启本身不会重置限额。
+2. 按序重放 `events.log`：事件记录走 **trusted 通道**并入聚合
+   （历史已接受事实，不受重启后更高水位/封口影响），且只有
+   `channel=online` 的记录推进水位（与运行期行为一致）；
+   **水位标记**记录精确还原显式 flush 的推进——包括"flush 推进超过
+   最大事件时间"的部分，重启前后"窗口已关"的判定保持一致；
+   已接受事件同时补入去重与基数集合；
+3. 恢复限流状态：优先读 `limiter.json`（每次消费后落盘，是最新状态），
+   不存在则回落到快照内嵌的限流字段（兼容旧版单桶格式）——
+   重启前已用掉的配额继续有效，重启本身不会重置限额。
 
 运行期调用 `pipeline.snapshot()` 会用「临时文件 + fsync + 原子 rename」
 写入快照（聚合 + 告警 + 幂等键/序列集合 + 限流余量）并清空 WAL，
@@ -166,6 +205,9 @@ uv run pytest tests/test_observability_scenarios.py -s
 
 # 只看批量补报/重放场景（日志含窗口区间、幂等键、逐条判定依据）
 uv run pytest tests/test_backfill.py -s
+
+# 只看补报确定性场景（乱序/分批/并发/跨重启/机器快慢）
+uv run pytest tests/test_backfill_determinism.py -s
 
 # 启动 HTTP 演示服务
 uv run uvicorn main:app --reload
@@ -228,5 +270,11 @@ pipe.export("./data/report.json")
 | 并发补报同键恰好一次 | `test_backfill_concurrent_submission_accepted_once` |
 | 同一批重复补报幂等 | `test_backfill_repeat_submission_is_idempotent` |
 | 补报跨重启重放一致（WAL / 快照） | `test_backfill_restart_replay_consistent` |
-| 限流配额跨重启延续 | `test_backfill_quota_persists_across_restart` |
-| 补报与在线采集兼容 | `test_backfill_coexists_with_online_ingest` |
+| 限流配额跨重启延续 | `test_backfill_quota_persists_across_restart`、`test_restart_without_snapshot_preserves_quota_and_dedup` |
+| 补报与在线采集兼容 | `test_backfill_coexists_with_online_ingest`、`test_backfill_and_online_quotas_are_independent` |
+| 补报结论与排序/切分无关 | `test_verdicts_independent_of_order_and_splitting` |
+| 并发分批补报确定性 | `test_concurrent_split_submission_deterministic` |
+| 补报不提前关掉在线窗口 | `test_backfill_does_not_close_online_windows` |
+| 显式水位跨重启精确还原 | `test_restart_without_snapshot_preserves_explicit_watermark` |
+| 限流结论与机器快慢无关（注入时钟） | `test_rate_limit_verdicts_machine_speed_independent` |
+| 跨重启重复补报逐条一致 | `test_repeat_backfill_across_restart_matches` |

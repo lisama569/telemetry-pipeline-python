@@ -5,8 +5,10 @@
   因此乱序到达的同一批事件必定落到同一窗口；
 - 聚合只做 count/sum/min/max/avg（全部与输入顺序无关），
   窗口可反复重放，结论稳定一致；
-- 水位线 ``watermark_ms`` = 已观察到的最大事件时间，单调不允许回退，
-  显式回退游标 -> ``CURSOR_BACKWARD``；
+- 水位线 ``watermark_ms`` 单调不允许回退，显式回退游标 -> ``CURSOR_BACKWARD``；
+  在线（online）通道的事件会随事件时间推进水位；补报（backfill）通道
+  只读水位、绝不推进（``apply(..., advance_watermark=False)``），
+  因此同一批历史数据无论怎么排序/分批/并发，窗口开闭判定都一致；
 - 当 ``window_end + allowed_lateness <= watermark`` 时窗口封口（sealed）：
   封口结果冻结为不可变快照，再写入 -> ``WINDOW_CLOSED``；
 - 封口前允许迟到数据（out-of-order）就地并入，下次封口时结论仍是确定的。
@@ -77,11 +79,16 @@ class WindowAggregator:
                 return RejectReason.WINDOW_CLOSED
             return None
 
-    def apply(self, record: dict, *, trusted: bool = False) -> RejectReason | None:
+    def apply(self, record: dict, *, trusted: bool = False,
+              advance_watermark: bool = True) -> RejectReason | None:
         """并入一条事件记录。
 
         ``trusted=True`` 用于重启重放：记录是过去已接受的事实，
         跳过水位/封口检查，但仍保持聚合运算的确定性。
+
+        ``advance_watermark=False`` 用于补报（backfill）通道：只读水位、
+        绝不推进——补报历史不能把在线仍在接收的窗口提前关掉，
+        同一批历史数据的窗口开闭判定也不因批内顺序/分批/并发而漂移。
         """
         with self._lock:
             ts = record["timestamp_ms"]
@@ -99,8 +106,8 @@ class WindowAggregator:
 
             self._merge(key, series, ws, record)
 
-            # 随事件推进水位（只增不减）
-            if ts > self._watermark_ms:
+            # 仅在线通道随事件推进水位（只增不减）；补报通道不触碰水位
+            if advance_watermark and ts > self._watermark_ms:
                 self._watermark_ms = ts
             return None
 
@@ -177,7 +184,14 @@ class WindowAggregator:
                 "window_size_ms": self.window_size_ms,
                 "allowed_lateness_ms": self.allowed_lateness_ms,
                 "watermark_ms": self._watermark_ms,
-                "windows": [asdict(a) for a in self._windows.values()],
+                # 排序确定：同一状态的快照字节级可复现，与窗口建立顺序无关
+                "windows": [
+                    asdict(a)
+                    for a in sorted(
+                        self._windows.values(),
+                        key=lambda a: (a.window_start_ms, a.series),
+                    )
+                ],
             }
 
     def restore(self, state: dict, replay: Iterable[dict] = ()) -> None:
